@@ -216,22 +216,6 @@ fn run_simulator(
     env: SimulatorEnv,
     plan: InteractionPlan,
 ) -> anyhow::Result<()> {
-    std::panic::set_hook(Box::new(move |info| {
-        tracing::error!("panic occurred");
-
-        let payload = info.payload();
-        if let Some(s) = payload.downcast_ref::<&str>() {
-            tracing::error!("{}", s);
-        } else if let Some(s) = payload.downcast_ref::<String>() {
-            tracing::error!("{}", s);
-        } else {
-            tracing::error!("unknown panic payload");
-        }
-
-        let bt = Backtrace::force_capture();
-        tracing::error!("captured backtrace:\n{}", bt);
-    }));
-
     let last_execution = Arc::new(Mutex::new(Execution::new(0, 0)));
     let mut gen_rng = env.gen_rng();
 
@@ -266,6 +250,12 @@ fn run_simulator(
                 } else {
                     "unknown panic payload".to_string()
                 };
+                let bt = std::backtrace::Backtrace::force_capture();
+                tracing::error!(
+                    "simulation thread panicked: {}\nbacktrace:\n{}",
+                    err_msg,
+                    bt
+                );
                 SandboxedResult::Panicked {
                     error: err_msg,
                     last_execution: *last_execution.lock().unwrap(),
