@@ -14,9 +14,10 @@ use std::any::Any;
 use std::backtrace::Backtrace;
 use std::fs::OpenOptions;
 use std::io::{IsTerminal, Write};
+use std::panic::AssertUnwindSafe;
 use std::path::Path;
-use std::rc::Rc;
 use std::sync::{Arc, Mutex, mpsc};
+use std::thread;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::field::MakeExt;
 use tracing_subscriber::fmt::format;
@@ -236,21 +237,41 @@ fn run_simulator(
 
     let env = Arc::new(Mutex::new(env));
     // Need to wrap in Rc Mutex due to the UnwindSafe barrier
-    let plan = Rc::new(Mutex::new(plan));
+    let plan = Arc::new(Mutex::new(plan));
 
     let result = {
         let sim_execution = last_execution.clone();
         let sim_plan = plan.clone();
         let sim_env = env.clone();
 
-        SandboxedResult::from(
-            std::panic::catch_unwind(move || {
+        let handle = thread::spawn(move || {
+            std::panic::catch_unwind(AssertUnwindSafe(move || {
                 let mut sim_plan = sim_plan.lock().unwrap();
                 let plan = sim_plan.generator(&mut gen_rng);
-                run_simulation(sim_env, plan, sim_execution)
-            }),
-            last_execution.clone(),
-        )
+                run_simulation(sim_env.clone(), plan, sim_execution)
+            }))
+        });
+
+        match handle.join() {
+            Ok(Ok(exec_result)) => SandboxedResult::from(Ok(exec_result), last_execution.clone()),
+            Ok(Err(panic_payload)) => {
+                SandboxedResult::from(Err(panic_payload), last_execution.clone())
+            }
+            Err(thread_panic) => {
+                tracing::error!("simulation thread panicked unexpectedly");
+                let err_msg = if let Some(s) = thread_panic.downcast_ref::<&str>() {
+                    s.to_string()
+                } else if let Some(s) = thread_panic.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "unknown panic payload".to_string()
+                };
+                SandboxedResult::Panicked {
+                    error: err_msg,
+                    last_execution: *last_execution.lock().unwrap(),
+                }
+            }
+        }
     };
     env.clear_poison();
     plan.clear_poison();
