@@ -847,6 +847,7 @@ pub enum InteractionType {
     /// close all connections and reopen the database and assert that no data was lost
     FsyncQuery(Query),
     FaultyQuery(Query),
+    Panik,
 }
 
 // FIXME: add the connection index here later
@@ -871,6 +872,7 @@ impl Display for InteractionType {
                 write!(f, "{query};")
             }
             Self::FaultyQuery(query) => write!(f, "{query}; -- FAULTY QUERY"),
+            Self::Panik => write!(f, "-- PANIC"),
         }
     }
 }
@@ -889,7 +891,8 @@ impl Shadow for InteractionType {
             | Self::Assertion(_)
             | Self::Fault(_)
             | Self::FaultyQuery(_)
-            | Self::FsyncQuery(_) => Ok(vec![]),
+            | Self::FsyncQuery(_)
+            | Self::Panik => Ok(vec![]),
         }
     }
 }
@@ -1160,7 +1163,7 @@ impl InteractionType {
     }
 }
 
-fn reopen_database(env: &mut SimulatorEnv) {
+pub fn reopen_database(env: &mut SimulatorEnv) {
     // 1. Close all connections without default checkpoint-on-close behavior
     // to expose bugs related to how we handle WAL
     let mvcc = env.profile.experimental_mvcc;

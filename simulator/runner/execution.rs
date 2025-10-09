@@ -1,3 +1,4 @@
+use core::panic;
 use std::sync::{Arc, Mutex};
 
 use sql_generation::model::table::SimValue;
@@ -235,6 +236,9 @@ pub fn execute_interaction_turso(
                 limbo_integrity_check(&conn)?;
             }
         }
+        InteractionType::Panik => {
+            panic!("Panik interaction executed");
+        }
     }
     let _ = interaction.shadow(&mut env.get_conn_tables_mut(interaction.connection_index));
     Ok(ExecutionContinuation::NextInteraction)
@@ -332,6 +336,9 @@ fn execute_interaction_rusqlite(
         }
         InteractionType::FaultyQuery(_) => {
             unimplemented!("cannot implement faulty query in rusqlite, as we do not control IO");
+        }
+        InteractionType::Panik => {
+            panic!("Panik interaction executed")
         }
     }
 
