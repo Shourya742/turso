@@ -11,6 +11,7 @@ use crate::{
     LimboError, OpenFlags, Result, Statement, StepResult, SymbolTable,
 };
 use crate::{Connection, MvStore, IO};
+use std::sync::atomic::AtomicU8;
 use std::{
     collections::HashMap,
     rc::Rc,
@@ -27,12 +28,6 @@ use turso_parser::parser::Parser;
 macro_rules! io_yield_one {
     ($c:expr) => {
         return Ok(IOResult::IO(IOCompletions::Single($c)));
-    };
-}
-#[macro_export]
-macro_rules! io_yield_many {
-    ($v:expr) => {
-        return Ok(IOResult::IO(IOCompletions::Many($v)));
     };
 }
 
@@ -312,7 +307,7 @@ pub fn module_args_from_sql(sql: &str) -> Result<Vec<turso_ext::Value>> {
 pub fn check_literal_equivalency(lhs: &Literal, rhs: &Literal) -> bool {
     match (lhs, rhs) {
         (Literal::Numeric(n1), Literal::Numeric(n2)) => cmp_numeric_strings(n1, n2),
-        (Literal::String(s1), Literal::String(s2)) => check_ident_equivalency(s1, s2),
+        (Literal::String(s1), Literal::String(s2)) => s1 == s2,
         (Literal::Blob(b1), Literal::Blob(b2)) => b1 == b2,
         (Literal::Keyword(k1), Literal::Keyword(k2)) => check_ident_equivalency(k1, k2),
         (Literal::Null, Literal::Null) => true,
@@ -860,11 +855,19 @@ pub fn cast_text_to_real(text: &str) -> Value {
 /// IEEE 754 64-bit float and thus provides a 1-bit of margin for the text-to-float conversion operation.)
 /// Any text input that describes a value outside the range of a 64-bit signed integer yields a REAL result.
 /// Casting a REAL or INTEGER value to NUMERIC is a no-op, even if a real value could be losslessly converted to an integer.
-pub fn checked_cast_text_to_numeric(text: &str) -> std::result::Result<Value, ()> {
+///
+/// `lossless`: If `true`, rejects the input if any characters remain after the numeric prefix (strict / exact conversion).
+pub fn checked_cast_text_to_numeric(text: &str, lossless: bool) -> std::result::Result<Value, ()> {
     // sqlite will parse the first N digits of a string to numeric value, then determine
     // whether _that_ value is more likely a real or integer value. e.g.
     // '-100234-2344.23e14' evaluates to -100234 instead of -100234.0
+    let original_len = text.trim().len();
     let (kind, text) = parse_numeric_str(text)?;
+
+    if original_len != text.len() && lossless {
+        return Err(());
+    }
+
     match kind {
         ValueType::Integer => match text.parse::<i64>() {
             Ok(i) => Ok(Value::Integer(i)),
@@ -945,7 +948,7 @@ fn parse_numeric_str(text: &str) -> Result<(ValueType, &str), ()> {
 }
 
 pub fn cast_text_to_numeric(txt: &str) -> Value {
-    checked_cast_text_to_numeric(txt).unwrap_or(Value::Integer(0))
+    checked_cast_text_to_numeric(txt, false).unwrap_or(Value::Integer(0))
 }
 
 // Check if float can be losslessly converted to 51-bit integer
@@ -1337,10 +1340,43 @@ pub fn extract_view_columns(
     Ok(ViewColumnSchema { tables, columns })
 }
 
+pub fn rewrite_fk_parent_cols_if_self_ref(
+    clause: &mut ast::ForeignKeyClause,
+    table: &str,
+    from: &str,
+    to: &str,
+) {
+    if normalize_ident(clause.tbl_name.as_str()) == normalize_ident(table) {
+        for c in &mut clause.columns {
+            if normalize_ident(c.col_name.as_str()) == normalize_ident(from) {
+                c.col_name = ast::Name::exact(to.to_owned());
+            }
+        }
+    }
+}
+
+/// Update a column-level REFERENCES <tbl>(col,...) constraint
+pub fn rewrite_column_references_if_needed(
+    col: &mut ast::ColumnDefinition,
+    table: &str,
+    from: &str,
+    to: &str,
+) {
+    for cc in &mut col.constraints {
+        if let ast::NamedColumnConstraint {
+            constraint: ast::ColumnConstraint::ForeignKey { clause, .. },
+            ..
+        } = cc
+        {
+            rewrite_fk_parent_cols_if_self_ref(clause, table, from, to);
+        }
+    }
+}
+
 #[cfg(test)]
 pub mod tests {
     use super::*;
-    use crate::schema::Type as SchemaValueType;
+    use crate::{schema::Type as SchemaValueType, types::Text};
     use turso_parser::ast::{self, Expr, Literal, Name, Operator::*, Type};
 
     #[test]
@@ -2350,5 +2386,45 @@ pub mod tests {
             let result = type_from_name(input);
             assert_eq!(result, expected, "Failed for input: {input}");
         }
+    }
+
+    #[test]
+    fn test_checked_cast_text_to_numeric_lossless_property() {
+        use Value::*;
+        assert_eq!(checked_cast_text_to_numeric("1.xx", true), Err(()));
+        assert_eq!(checked_cast_text_to_numeric("abc", true), Err(()));
+        assert_eq!(checked_cast_text_to_numeric("--5", true), Err(()));
+        assert_eq!(checked_cast_text_to_numeric("12.34.56", true), Err(()));
+        assert_eq!(checked_cast_text_to_numeric("", true), Err(()));
+        assert_eq!(checked_cast_text_to_numeric(" ", true), Err(()));
+        assert_eq!(checked_cast_text_to_numeric("0", true), Ok(Integer(0)));
+        assert_eq!(checked_cast_text_to_numeric("42", true), Ok(Integer(42)));
+        assert_eq!(checked_cast_text_to_numeric("-42", true), Ok(Integer(-42)));
+        assert_eq!(
+            checked_cast_text_to_numeric("999999999999", true),
+            Ok(Integer(999_999_999_999))
+        );
+        assert_eq!(checked_cast_text_to_numeric("1.0", true), Ok(Float(1.0)));
+        assert_eq!(
+            checked_cast_text_to_numeric("-3.22", true),
+            Ok(Float(-3.22))
+        );
+        assert_eq!(
+            checked_cast_text_to_numeric("0.001", true),
+            Ok(Float(0.001))
+        );
+        assert_eq!(checked_cast_text_to_numeric("2e3", true), Ok(Float(2000.0)));
+        assert_eq!(
+            checked_cast_text_to_numeric("-5.5e-2", true),
+            Ok(Float(-0.055))
+        );
+        assert_eq!(
+            checked_cast_text_to_numeric(" 123 ", true),
+            Ok(Integer(123))
+        );
+        assert_eq!(
+            checked_cast_text_to_numeric("\t-3.22\n", true),
+            Ok(Float(-3.22))
+        );
     }
 }

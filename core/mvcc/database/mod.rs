@@ -5,6 +5,7 @@ use crate::state_machine::StateTransition;
 use crate::state_machine::TransitionResult;
 use crate::storage::btree::BTreeCursor;
 use crate::storage::btree::BTreeKey;
+use crate::storage::btree::CursorTrait;
 use crate::storage::btree::CursorValidState;
 use crate::storage::sqlite3_ondisk::DatabaseHeader;
 use crate::storage::wal::TursoRwLock;
@@ -1883,7 +1884,6 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             .value()
             .unwrap_or_else(|| panic!("Table ID does not have a root page: {table_id}"));
         let mut cursor = BTreeCursor::new_table(
-            None, // No MVCC cursor for scanning
             pager.clone(),
             root_page as i64,
             1, // We'll adjust this as needed

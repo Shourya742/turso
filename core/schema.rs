@@ -72,7 +72,7 @@ impl Clone for View {
 /// Type alias for regular views collection
 pub type ViewsMap = HashMap<String, Arc<View>>;
 
-use crate::storage::btree::BTreeCursor;
+use crate::storage::btree::{BTreeCursor, CursorTrait};
 use crate::translate::collate::CollationSeq;
 use crate::translate::plan::{SelectPlan, TableReferences};
 use crate::util::{
@@ -289,9 +289,11 @@ impl Schema {
     }
 
     /// Add a regular (non-materialized) view
-    pub fn add_view(&mut self, view: View) {
+    pub fn add_view(&mut self, view: View) -> Result<()> {
+        self.check_object_name_conflict(&view.name)?;
         let name = normalize_ident(&view.name);
         self.views.insert(name, Arc::new(view));
+        Ok(())
     }
 
     /// Get a regular view by name
@@ -300,14 +302,18 @@ impl Schema {
         self.views.get(&name).cloned()
     }
 
-    pub fn add_btree_table(&mut self, table: Arc<BTreeTable>) {
+    pub fn add_btree_table(&mut self, table: Arc<BTreeTable>) -> Result<()> {
+        self.check_object_name_conflict(&table.name)?;
         let name = normalize_ident(&table.name);
         self.tables.insert(name, Table::BTree(table).into());
+        Ok(())
     }
 
-    pub fn add_virtual_table(&mut self, table: Arc<VirtualTable>) {
+    pub fn add_virtual_table(&mut self, table: Arc<VirtualTable>) -> Result<()> {
+        self.check_object_name_conflict(&table.name)?;
         let name = normalize_ident(&table.name);
         self.tables.insert(name, Table::Virtual(table).into());
+        Ok(())
     }
 
     pub fn get_table(&self, name: &str) -> Option<Arc<Table>> {
@@ -340,7 +346,8 @@ impl Schema {
         }
     }
 
-    pub fn add_index(&mut self, index: Arc<Index>) {
+    pub fn add_index(&mut self, index: Arc<Index>) -> Result<()> {
+        self.check_object_name_conflict(&index.name)?;
         let table_name = normalize_ident(&index.table_name);
         // We must add the new index to the front of the deque, because SQLite stores index definitions as a linked list
         // where the newest parsed index entry is at the head of list. If we would add it to the back of a regular Vec for example,
@@ -350,7 +357,8 @@ impl Schema {
         self.indexes
             .entry(table_name)
             .or_default()
-            .push_front(index.clone())
+            .push_front(index.clone());
+        Ok(())
     }
 
     pub fn get_indices(&self, table_name: &str) -> impl Iterator<Item = &Arc<Index>> {
@@ -406,7 +414,7 @@ impl Schema {
             mv_cursor.is_none(),
             "mvcc not yet supported for make_from_btree"
         );
-        let mut cursor = BTreeCursor::new_table(mv_cursor, Arc::clone(&pager), 1, 10);
+        let mut cursor = BTreeCursor::new_table(Arc::clone(&pager), 1, 10);
 
         let mut from_sql_indexes = Vec::with_capacity(10);
         let mut automatic_indices: HashMap<String, Vec<(String, i64)>> = HashMap::with_capacity(10);
@@ -507,7 +515,7 @@ impl Schema {
                     unparsed_sql_from_index.root_page,
                     table.as_ref(),
                 )?;
-                self.add_index(Arc::new(index));
+                self.add_index(Arc::new(index))?;
             }
         }
 
@@ -549,7 +557,7 @@ impl Schema {
                         table.as_ref(),
                         automatic_indexes.pop().unwrap(),
                         1,
-                    )?));
+                    )?))?;
                 } else {
                     // Add single column unique index
                     if let Some(autoidx) = automatic_indexes.pop() {
@@ -557,7 +565,7 @@ impl Schema {
                             table.as_ref(),
                             autoidx,
                             vec![(pos_in_table, unique_set.columns.first().unwrap().1)],
-                        )?));
+                        )?))?;
                     }
                 }
             }
@@ -575,7 +583,7 @@ impl Schema {
                         table.as_ref(),
                         automatic_indexes.pop().unwrap(),
                         unique_set.columns.len(),
-                    )?));
+                    )?))?;
                 } else {
                     // Add composite unique index
                     let mut column_indices_and_sort_orders =
@@ -593,7 +601,7 @@ impl Schema {
                         table.as_ref(),
                         automatic_indexes.pop().unwrap(),
                         column_indices_and_sort_orders,
-                    )?));
+                    )?))?;
                 }
             }
 
@@ -701,7 +709,7 @@ impl Schema {
                             syms,
                         )?
                     };
-                    self.add_virtual_table(vtab);
+                    self.add_virtual_table(vtab)?;
                 } else {
                     let table = BTreeTable::from_sql(sql, root_page)?;
 
@@ -735,7 +743,7 @@ impl Schema {
                         }
                     }
 
-                    self.add_btree_table(Arc::new(table));
+                    self.add_btree_table(Arc::new(table))?;
                 }
             }
             "index" => {
@@ -834,7 +842,7 @@ impl Schema {
                             // Create regular view
                             let view =
                                 View::new(name.to_string(), sql.to_string(), select, final_columns);
-                            self.add_view(view);
+                            self.add_view(view)?;
                         }
                         _ => {}
                     }
@@ -1105,6 +1113,32 @@ impl Schema {
             .and_then(|t| t.btree())
             .is_some_and(|t| !t.foreign_keys.is_empty())
     }
+
+    fn check_object_name_conflict(&self, name: &str) -> Result<()> {
+        let normalized_name = normalize_ident(name);
+
+        if self.tables.contains_key(&normalized_name) {
+            return Err(crate::LimboError::ParseError(
+                ["table \"", name, "\" already exists"].concat().to_string(),
+            ));
+        }
+
+        if self.views.contains_key(&normalized_name) {
+            return Err(crate::LimboError::ParseError(
+                ["view \"", name, "\" already exists"].concat().to_string(),
+            ));
+        }
+
+        for index_list in self.indexes.values() {
+            if index_list.iter().any(|i| i.name.eq_ignore_ascii_case(name)) {
+                return Err(crate::LimboError::ParseError(
+                    ["index \"", name, "\" already exists"].concat().to_string(),
+                ));
+            }
+        }
+
+        Ok(())
+    }
 }
 
 impl Clone for Schema {
@@ -1324,6 +1358,8 @@ impl BTreeTable {
     /// `CREATE TABLE t (x)`, whereas sqlite stores it with the original extra whitespace.
     pub fn to_sql(&self) -> String {
         let mut sql = format!("CREATE TABLE {} (", self.name);
+        let needs_pk_inline = self.primary_key_columns.len() == 1;
+        // Add columns
         for (i, column) in self.columns.iter().enumerate() {
             if i > 0 {
                 sql.push_str(", ");
@@ -1350,14 +1386,71 @@ impl BTreeTable {
             if column.unique {
                 sql.push_str(" UNIQUE");
             }
-
-            if column.primary_key {
+            if needs_pk_inline && column.primary_key {
                 sql.push_str(" PRIMARY KEY");
             }
 
             if let Some(default) = &column.default {
                 sql.push_str(" DEFAULT ");
                 sql.push_str(&default.to_string());
+            }
+        }
+
+        let has_table_pk = !self.primary_key_columns.is_empty();
+        // Add table-level PRIMARY KEY constraint if exists
+        if !needs_pk_inline && has_table_pk {
+            sql.push_str(", PRIMARY KEY (");
+            for (i, col) in self.primary_key_columns.iter().enumerate() {
+                if i > 0 {
+                    sql.push_str(", ");
+                }
+                sql.push_str(&col.0);
+            }
+            sql.push(')');
+        }
+
+        for fk in &self.foreign_keys {
+            sql.push_str(", FOREIGN KEY (");
+            for (i, col) in fk.child_columns.iter().enumerate() {
+                if i > 0 {
+                    sql.push_str(", ");
+                }
+                sql.push_str(col);
+            }
+            sql.push_str(") REFERENCES ");
+            sql.push_str(&fk.parent_table);
+            sql.push('(');
+            for (i, col) in fk.parent_columns.iter().enumerate() {
+                if i > 0 {
+                    sql.push_str(", ");
+                }
+                sql.push_str(col);
+            }
+            sql.push(')');
+
+            // Add ON DELETE/UPDATE actions, NoAction is default so just make empty in that case
+            if fk.on_delete != RefAct::NoAction {
+                sql.push_str(" ON DELETE ");
+                sql.push_str(match fk.on_delete {
+                    RefAct::SetNull => "SET NULL",
+                    RefAct::SetDefault => "SET DEFAULT",
+                    RefAct::Cascade => "CASCADE",
+                    RefAct::Restrict => "RESTRICT",
+                    _ => "",
+                });
+            }
+            if fk.on_update != RefAct::NoAction {
+                sql.push_str(" ON UPDATE ");
+                sql.push_str(match fk.on_update {
+                    RefAct::SetNull => "SET NULL",
+                    RefAct::SetDefault => "SET DEFAULT",
+                    RefAct::Cascade => "CASCADE",
+                    RefAct::Restrict => "RESTRICT",
+                    _ => "",
+                });
+            }
+            if fk.deferred {
+                sql.push_str(" DEFERRABLE INITIALLY DEFERRED");
             }
         }
         sql.push(')');
@@ -1553,6 +1646,12 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     foreign_keys.push(Arc::new(fk));
                 }
             }
+
+            // Due to a bug in SQLite, this check is needed to maintain backwards compatibility with rowid alias
+            // SQLite docs: https://sqlite.org/lang_createtable.html#rowids_and_the_integer_primary_key
+            // Issue: https://github.com/tursodatabase/turso/issues/3665
+            let mut primary_key_desc_columns_constraint = false;
+
             for ast::ColumnDefinition {
                 col_name,
                 col_type,
@@ -1592,11 +1691,23 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                 let mut collation = None;
                 for c_def in constraints {
                     match &c_def.constraint {
+                        ast::ColumnConstraint::Check { .. } => {
+                            crate::bail_parse_error!("CHECK constraints are not yet supported");
+                        }
+                        ast::ColumnConstraint::Generated { .. } => {
+                            crate::bail_parse_error!("GENERATED columns are not yet supported");
+                        }
                         ast::ColumnConstraint::PrimaryKey {
                             order: o,
                             auto_increment,
+                            conflict_clause,
                             ..
                         } => {
+                            if conflict_clause.is_some() {
+                                crate::bail_parse_error!(
+                                    "ON CONFLICT not implemented for column definition"
+                                );
+                            }
                             if !primary_key_columns.is_empty() {
                                 crate::bail_parse_error!(
                                     "table \"{}\" has more than one primary key",
@@ -1615,7 +1726,16 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                                 is_primary_key: true,
                             });
                         }
-                        ast::ColumnConstraint::NotNull { nullable, .. } => {
+                        ast::ColumnConstraint::NotNull {
+                            nullable,
+                            conflict_clause,
+                            ..
+                        } => {
+                            if conflict_clause.is_some() {
+                                crate::bail_parse_error!(
+                                    "ON CONFLICT not implemented for column definition"
+                                );
+                            }
                             notnull = !nullable;
                         }
                         ast::ColumnConstraint::Default(ref expr) => {
@@ -1624,9 +1744,11 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                             );
                         }
                         // TODO: for now we don't check Resolve type of unique
-                        ast::ColumnConstraint::Unique(on_conflict) => {
-                            if on_conflict.is_some() {
-                                unimplemented!("ON CONFLICT not implemented");
+                        ast::ColumnConstraint::Unique(conflict) => {
+                            if conflict.is_some() {
+                                crate::bail_parse_error!(
+                                    "ON CONFLICT not implemented for column definition"
+                                );
                             }
                             unique = true;
                             unique_sets.push(UniqueSet {
@@ -1684,12 +1806,14 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                             };
                             foreign_keys.push(Arc::new(fk));
                         }
-                        _ => {}
                     }
                 }
 
                 if primary_key {
                     primary_key_columns.push((name.clone(), order));
+                    if order == SortOrder::Desc {
+                        primary_key_desc_columns_constraint = true;
+                    }
                 } else if primary_key_columns
                     .iter()
                     .any(|(col_name, _)| col_name == &name)
@@ -1702,7 +1826,9 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     ty,
                     ty_str,
                     primary_key,
-                    is_rowid_alias: typename_exactly_integer && primary_key,
+                    is_rowid_alias: typename_exactly_integer
+                        && primary_key
+                        && !primary_key_desc_columns_constraint,
                     notnull,
                     default,
                     unique,

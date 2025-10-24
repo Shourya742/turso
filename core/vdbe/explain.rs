@@ -1141,7 +1141,7 @@ pub fn insn_to_row(
                 flag.0 as u16,
                 format!("intkey=r[{key_reg}] data=r[{record_reg}]"),
             ),
-            Insn::Delete { cursor_id, table_name } => (
+            Insn::Delete { cursor_id, table_name, .. } => (
                 "Delete",
                 *cursor_id as i32,
                 0,
@@ -1804,19 +1804,19 @@ pub fn insn_to_row(
             0,
             String::new(),
         ),
-        Insn::FkCounter{increment_value, is_scope } => (
+        Insn::FkCounter{increment_value, deferred } => (
         "FkCounter",
             *increment_value as i32,
-            *is_scope as i32,
+            *deferred as i32,
             0,
             Value::build_text(""),
             0,
             String::new(),
         ),
-        Insn::FkIfZero{target_pc, is_scope } => (
+        Insn::FkIfZero{target_pc, deferred } => (
         "FkIfZero",
             target_pc.as_debug_int(),
-            *is_scope as i32,
+            *deferred as i32,
             0,
             Value::build_text(""),
             0,

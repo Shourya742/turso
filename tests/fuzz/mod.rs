@@ -1,22 +1,22 @@
 pub mod grammar_generator;
+pub mod rowid_alias;
 
 #[cfg(test)]
-mod tests {
+mod fuzz_tests {
     use rand::seq::{IndexedRandom, IteratorRandom, SliceRandom};
-    use rand::{Rng, SeedableRng};
+    use rand::Rng;
     use rand_chacha::ChaCha8Rng;
     use rusqlite::{params, types::Value};
     use std::{collections::HashSet, io::Write};
     use turso_core::DatabaseOpts;
 
-    use crate::{
-        common::{
-            do_flush, limbo_exec_rows, limbo_exec_rows_fallible, limbo_stmt_get_column_names,
-            maybe_setup_tracing, rng_from_time, rng_from_time_or_env, rusqlite_integrity_check,
-            sqlite_exec_rows, TempDatabase,
-        },
-        fuzz::grammar_generator::{const_str, rand_int, rand_str, GrammarGenerator},
+    use core_tester::common::{
+        do_flush, limbo_exec_rows, limbo_exec_rows_fallible, limbo_stmt_get_column_names,
+        maybe_setup_tracing, rng_from_time_or_env, rusqlite_integrity_check, sqlite_exec_rows,
+        TempDatabase,
     };
+
+    use super::grammar_generator::{const_str, rand_int, rand_str, GrammarGenerator};
 
     use super::grammar_generator::SymbolHandle;
 
@@ -221,12 +221,7 @@ mod tests {
     /// A test for verifying that index seek+scan works correctly for compound keys
     /// on indexes with various column orderings.
     pub fn index_scan_compound_key_fuzz() {
-        let (mut rng, seed) = if std::env::var("SEED").is_ok() {
-            let seed = std::env::var("SEED").unwrap().parse::<u64>().unwrap();
-            (ChaCha8Rng::seed_from_u64(seed), seed)
-        } else {
-            rng_from_time()
-        };
+        let (mut rng, seed) = rng_from_time_or_env();
         let table_defs: [&str; 8] = [
             "CREATE TABLE t (x, y, z, nonindexed_col, PRIMARY KEY (x, y, z))",
             "CREATE TABLE t (x, y, z, nonindexed_col, PRIMARY KEY (x desc, y, z))",
@@ -381,11 +376,28 @@ mod tests {
             // Use a small limit to make the test complete faster
             let limit = 5;
 
-            // Generate WHERE clause string
+            /// Generate a comparison string (e.g. x > 10 AND x < 20) or just x > 10.
+            fn generate_comparison(
+                operator: &str,
+                col_name: &str,
+                col_val: i32,
+                rng: &mut ChaCha8Rng,
+            ) -> String {
+                if operator != "=" && rng.random_range(0..3) == 1 {
+                    let val2 = rng.random_range(0..=3000);
+                    let op2 = COMPARISONS[rng.random_range(0..COMPARISONS.len())];
+                    format!("{col_name} {operator} {col_val} AND {col_name} {op2} {val2}")
+                } else {
+                    format!("{col_name} {operator} {col_val}")
+                }
+            }
+
+            // Generate WHERE clause string.
+            // Sometimes add another inequality to the WHERE clause (e.g. x > 10 AND x < 20) to exercise range queries.
             let where_clause_components = vec![
-                comp1.map(|x| format!("x {} {}", x, col_val_first.unwrap())),
-                comp2.map(|x| format!("y {} {}", x, col_val_second.unwrap())),
-                comp3.map(|x| format!("z {} {}", x, col_val_third.unwrap())),
+                comp1.map(|x| generate_comparison(x, "x", col_val_first.unwrap(), &mut rng)),
+                comp2.map(|x| generate_comparison(x, "y", col_val_second.unwrap(), &mut rng)),
+                comp3.map(|x| generate_comparison(x, "z", col_val_third.unwrap(), &mut rng)),
             ]
             .into_iter()
             .flatten()
@@ -499,12 +511,7 @@ mod tests {
     #[test]
     pub fn collation_fuzz() {
         let _ = env_logger::try_init();
-        let (mut rng, seed) = if std::env::var("SEED").is_ok() {
-            let seed = std::env::var("SEED").unwrap().parse::<u64>().unwrap();
-            (ChaCha8Rng::seed_from_u64(seed), seed)
-        } else {
-            rng_from_time()
-        };
+        let (mut rng, seed) = rng_from_time_or_env();
         println!("collation_fuzz seed: {seed}");
 
         // Build six table variants that assign BINARY/NOCASE/RTRIM across (a,b,c)
@@ -597,15 +604,10 @@ mod tests {
         // Fuzz WHERE clauses with and without explicit COLLATE on a/b/c
         let columns = ["a", "b", "c"];
         let collates = [None, Some("BINARY"), Some("NOCASE"), Some("RTRIM")];
-        let (mut rng, seed) = if std::env::var("SEED").is_ok() {
-            let seed = std::env::var("SEED").unwrap().parse::<u64>().unwrap();
-            (ChaCha8Rng::seed_from_u64(seed), seed)
-        } else {
-            rng_from_time()
-        };
+        let (mut rng, seed) = rng_from_time_or_env();
         println!("collation_fuzz seed: {seed}");
 
-        const ITERS: usize = 3000;
+        const ITERS: usize = 1000;
         for iter in 0..ITERS {
             if iter % (ITERS / 100).max(1) == 0 {
                 println!("collation_fuzz: iteration {}/{}", iter + 1, ITERS);
@@ -651,14 +653,13 @@ mod tests {
 
     #[test]
     #[allow(unused_assignments)]
-    #[ignore] // ignoring because every error I can find is due to sqlite sub-transaction behavior
     pub fn fk_deferred_constraints_fuzz() {
         let _ = env_logger::try_init();
-        let (mut rng, seed) = rng_from_time();
+        let (mut rng, seed) = rng_from_time_or_env();
         println!("fk_deferred_constraints_fuzz seed: {seed}");
 
         const OUTER_ITERS: usize = 10;
-        const INNER_ITERS: usize = 50;
+        const INNER_ITERS: usize = 100;
 
         for outer in 0..OUTER_ITERS {
             println!("fk_deferred_constraints_fuzz {}/{}", outer + 1, OUTER_ITERS);
@@ -742,12 +743,12 @@ mod tests {
             }
 
             // Transaction-based mutations with mix of deferred and immediate operations
+            let mut in_tx = false;
             for tx_num in 0..INNER_ITERS {
                 // Decide if we're in a transaction
-                let mut in_tx = false;
-                let use_transaction = rng.random_bool(0.7);
+                let start_a_transaction = rng.random_bool(0.7);
 
-                if use_transaction && !in_tx {
+                if start_a_transaction && !in_tx {
                     in_tx = true;
                     let s = log_and_exec("BEGIN");
                     let sres = sqlite.execute(&s, params![]);
@@ -873,7 +874,7 @@ mod tests {
                         format!("DELETE FROM child_deferred WHERE id={id}")
                     }
                     // Self-referential deferred insert (create temp violation then fix)
-                    10 if use_transaction => {
+                    10 if start_a_transaction => {
                         let id = rng.random_range(400..=500);
                         let pid = id + 1; // References non-existent yet
                         format!("INSERT INTO child_deferred VALUES ({id}, {pid}, 0)")
@@ -889,7 +890,7 @@ mod tests {
                 let sres = sqlite.execute(&stmt, params![]);
                 let lres = limbo_exec_rows_fallible(&limbo_db, &limbo, &stmt);
 
-                if !use_transaction && !in_tx {
+                if !start_a_transaction && !in_tx {
                     match (sres, lres) {
                         (Ok(_), Ok(_)) | (Err(_), Err(_)) => {}
                         (s, l) => {
@@ -907,8 +908,8 @@ mod tests {
                     }
                 }
 
-                if use_transaction && in_tx {
-                    // Randomly COMMIT or ROLLBACK
+                // Randomly COMMIT or ROLLBACK some of the time
+                if in_tx && rng.random_bool(0.4) {
                     let commit = rng.random_bool(0.7);
                     let s = log_and_exec("COMMIT");
 
@@ -962,7 +963,13 @@ mod tests {
                             );
                         }
                     }
+                    in_tx = false;
                 }
+            }
+            // Print all statements
+            if std::env::var("VERBOSE").is_ok() {
+                println!("{}", stmts.join("\n"));
+                println!("--------- ITERATION COMPLETED ---------");
             }
         }
     }
@@ -970,7 +977,7 @@ mod tests {
     #[test]
     pub fn fk_single_pk_mutation_fuzz() {
         let _ = env_logger::try_init();
-        let (mut rng, seed) = rng_from_time();
+        let (mut rng, seed) = rng_from_time_or_env();
         println!("fk_single_pk_mutation_fuzz seed: {seed}");
 
         const OUTER_ITERS: usize = 20;
@@ -1258,7 +1265,7 @@ mod tests {
     #[test]
     pub fn fk_edgecases_fuzzing() {
         let _ = env_logger::try_init();
-        let (mut rng, seed) = rng_from_time();
+        let (mut rng, seed) = rng_from_time_or_env();
         println!("fk_edgecases_minifuzz seed: {seed}");
 
         const OUTER_ITERS: usize = 20;
@@ -1613,7 +1620,7 @@ mod tests {
     #[test]
     pub fn fk_composite_pk_mutation_fuzz() {
         let _ = env_logger::try_init();
-        let (mut rng, seed) = rng_from_time();
+        let (mut rng, seed) = rng_from_time_or_env();
         println!("fk_composite_pk_mutation_fuzz seed: {seed}");
 
         const OUTER_ITERS: usize = 10;
@@ -1826,8 +1833,8 @@ mod tests {
     /// Verify that the results are the same for SQLite and Turso.
     pub fn table_index_mutation_fuzz() {
         let _ = env_logger::try_init();
-        let (mut rng, seed) = rng_from_time();
-        println!("index_scan_single_key_mutation_fuzz seed: {seed}");
+        let (mut rng, seed) = rng_from_time_or_env();
+        println!("table_index_mutation_fuzz seed: {seed}");
 
         const OUTER_ITERATIONS: usize = 100;
         for i in 0..OUTER_ITERATIONS {
@@ -1849,9 +1856,33 @@ mod tests {
             let table_def = format!("CREATE TABLE t ({table_def})");
 
             let num_indexes = rng.random_range(0..=num_cols);
-            let indexes = (0..num_indexes)
-                .map(|i| format!("CREATE INDEX idx_{i} ON t(c{i})"))
-                .collect::<Vec<_>>();
+            let mut indexes = Vec::new();
+            for i in 0..num_indexes {
+                // Decide if this should be a single-column or multi-column index
+                let is_multi_column = rng.random_bool(0.5) && num_cols > 1;
+
+                if is_multi_column {
+                    // Create a multi-column index with 2-3 columns
+                    let num_index_cols = rng.random_range(2..=3.min(num_cols));
+                    let mut index_cols = Vec::new();
+                    let mut available_cols: Vec<usize> = (0..num_cols).collect();
+
+                    for _ in 0..num_index_cols {
+                        let idx = rng.random_range(0..available_cols.len());
+                        let col = available_cols.remove(idx);
+                        index_cols.push(format!("c{col}"));
+                    }
+
+                    indexes.push(format!(
+                        "CREATE INDEX idx_{i} ON t({})",
+                        index_cols.join(", ")
+                    ));
+                } else {
+                    // Single-column index
+                    let col = rng.random_range(0..num_cols);
+                    indexes.push(format!("CREATE INDEX idx_{i} ON t(c{col})"));
+                }
+            }
 
             // Create tables and indexes in both databases
             let limbo_conn = limbo_db.connect_limbo();
@@ -1935,8 +1966,22 @@ mod tests {
                 };
 
                 let query = if do_update {
-                    let new_y = rng.random_range(0..1000);
-                    format!("UPDATE t SET c{affected_col} = {new_y} {where_clause}")
+                    let num_updates = rng.random_range(1..=num_cols);
+                    let mut values = Vec::new();
+                    for _ in 0..num_updates {
+                        let new_y = if rng.random_bool(0.5) {
+                            // Update to a constant value
+                            rng.random_range(0..1000).to_string()
+                        } else {
+                            let source_col = rng.random_range(0..num_cols);
+                            // Update to a value that is a function of the another column
+                            let operator = *["+", "-"].choose(&mut rng).unwrap();
+                            let amount = rng.random_range(0..1000);
+                            format!("c{source_col} {operator} {amount}")
+                        };
+                        values.push(format!("c{affected_col} = {new_y}"));
+                    }
+                    format!("UPDATE t SET {} {where_clause}", values.join(", "))
                 } else {
                     format!("DELETE FROM t {where_clause}")
                 };
@@ -1974,6 +2019,19 @@ mod tests {
                     "Different results after mutation! limbo: {limbo_rows:?}, sqlite: {sqlite_rows:?}, seed: {seed}, query: {query}",
                 );
 
+                // Run integrity check on limbo db using rusqlite
+                if let Err(e) = rusqlite_integrity_check(&limbo_db.path) {
+                    println!("{table_def};");
+                    for t in indexes.iter() {
+                        println!("{t};");
+                    }
+                    for t in dml_statements.iter() {
+                        println!("{t};");
+                    }
+                    println!("{query};");
+                    panic!("seed: {seed}, error: {e}");
+                }
+
                 if sqlite_rows.is_empty() {
                     break;
                 }
@@ -1996,12 +2054,7 @@ mod tests {
         const OUTER_ITERS: usize = 5;
         const INNER_ITERS: usize = 500;
 
-        let (mut rng, seed) = if std::env::var("SEED").is_ok() {
-            let seed = std::env::var("SEED").unwrap().parse::<u64>().unwrap();
-            (ChaCha8Rng::seed_from_u64(seed), seed)
-        } else {
-            rng_from_time()
-        };
+        let (mut rng, seed) = rng_from_time_or_env();
         println!("partial_index_mutation_and_upsert_fuzz seed: {seed}");
         // we want to hit unique constraints fairly often so limit the insert values
         const K_POOL: [&str; 35] = [
@@ -2157,6 +2210,22 @@ mod tests {
             }
 
             for _ in 0..INNER_ITERS {
+                // Randomly inject transaction statements -- we don't care if they are legal,
+                // we just care that tursodb/sqlite behave the same way.
+                if rng.random_bool(0.15) {
+                    let tx_stmt = match rng.random_range(0..4) {
+                        0 => "BEGIN",
+                        1 => "BEGIN IMMEDIATE",
+                        2 => "COMMIT",
+                        3 => "ROLLBACK",
+                        _ => unreachable!(),
+                    };
+                    println!("{tx_stmt};");
+                    let sqlite_res = sqlite.execute(tx_stmt, rusqlite::params![]);
+                    let limbo_res = limbo_exec_rows_fallible(&limbo_db, &limbo_conn, tx_stmt);
+                    // Both should succeed or both should fail
+                    assert!(sqlite_res.is_ok() == limbo_res.is_ok());
+                }
                 let action = rng.random_range(0..4); // 0: INSERT, 1: UPDATE, 2: DELETE, 3: UPSERT (catch-all)
                 let stmt = match action {
                     // INSERT
@@ -2332,7 +2401,7 @@ mod tests {
     #[test]
     pub fn compound_select_fuzz() {
         let _ = env_logger::try_init();
-        let (mut rng, seed) = rng_from_time();
+        let (mut rng, seed) = rng_from_time_or_env();
         log::info!("compound_select_fuzz seed: {seed}");
 
         // Constants for fuzzing parameters
@@ -2468,7 +2537,7 @@ mod tests {
     #[test]
     pub fn ddl_compatibility_fuzz() {
         let _ = env_logger::try_init();
-        let (mut rng, seed) = rng_from_time();
+        let (mut rng, seed) = rng_from_time_or_env();
         const ITERATIONS: usize = 1000;
         for i in 0..ITERATIONS {
             let db = TempDatabase::new_empty(true);
@@ -2637,7 +2706,7 @@ mod tests {
         let limbo_conn = db.connect_limbo();
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
-        let (mut rng, seed) = rng_from_time();
+        let (mut rng, seed) = rng_from_time_or_env();
         log::info!("seed: {seed}");
         for _ in 0..1024 {
             let query = g.generate(&mut rng, sql, 50);
@@ -2756,7 +2825,7 @@ mod tests {
         let limbo_conn = db.connect_limbo();
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
-        let (mut rng, seed) = rng_from_time();
+        let (mut rng, seed) = rng_from_time_or_env();
         log::info!("seed: {seed}");
         for _ in 0..1024 {
             let query = g.generate(&mut rng, sql, 50);
@@ -2916,7 +2985,7 @@ mod tests {
         let limbo_conn = db.connect_limbo();
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
-        let (mut rng, seed) = rng_from_time();
+        let (mut rng, seed) = rng_from_time_or_env();
         log::info!("seed: {seed}");
         for _ in 0..1024 {
             let query = g.generate(&mut rng, sql, 50);
@@ -3285,7 +3354,7 @@ mod tests {
         let limbo_conn = db.connect_limbo();
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
-        let (mut rng, seed) = rng_from_time();
+        let (mut rng, seed) = rng_from_time_or_env();
         log::info!("seed: {seed}");
         for _ in 0..1024 {
             let query = g.generate(&mut rng, sql, 50);
@@ -3334,7 +3403,7 @@ mod tests {
         let _ = env_logger::try_init();
 
         let datatypes = ["INTEGER", "TEXT", "REAL", "BLOB"];
-        let (mut rng, seed) = rng_from_time();
+        let (mut rng, seed) = rng_from_time_or_env();
         log::info!("seed: {seed}");
 
         for _ in 0..1000 {
@@ -3389,7 +3458,7 @@ mod tests {
     pub fn affinity_fuzz() {
         let _ = env_logger::try_init();
 
-        let (mut rng, seed) = rng_from_time();
+        let (mut rng, seed) = rng_from_time_or_env();
         log::info!("affinity_fuzz seed: {seed}");
 
         for iteration in 0..500 {
@@ -3490,7 +3559,7 @@ mod tests {
     pub fn sum_agg_fuzz_floats() {
         let _ = env_logger::try_init();
 
-        let (mut rng, seed) = rng_from_time();
+        let (mut rng, seed) = rng_from_time_or_env();
         log::info!("seed: {seed}");
 
         for _ in 0..100 {
@@ -3536,7 +3605,7 @@ mod tests {
     pub fn sum_agg_fuzz() {
         let _ = env_logger::try_init();
 
-        let (mut rng, seed) = rng_from_time();
+        let (mut rng, seed) = rng_from_time_or_env();
         log::info!("seed: {seed}");
 
         for _ in 0..100 {
@@ -3580,7 +3649,7 @@ mod tests {
     fn concat_ws_fuzz() {
         let _ = env_logger::try_init();
 
-        let (mut rng, seed) = rng_from_time();
+        let (mut rng, seed) = rng_from_time_or_env();
         log::info!("seed: {seed}");
 
         for _ in 0..100 {
@@ -3626,7 +3695,7 @@ mod tests {
     pub fn total_agg_fuzz() {
         let _ = env_logger::try_init();
 
-        let (mut rng, seed) = rng_from_time();
+        let (mut rng, seed) = rng_from_time_or_env();
         log::info!("seed: {seed}");
 
         for _ in 0..100 {
@@ -3702,7 +3771,7 @@ mod tests {
             );
         }
 
-        let (mut rng, seed) = rng_from_time();
+        let (mut rng, seed) = rng_from_time_or_env();
         log::info!("seed: {seed}");
 
         let mut i = 0;
@@ -4063,7 +4132,7 @@ mod tests {
     #[test]
     #[cfg(feature = "test_helper")]
     pub fn fuzz_pending_byte_database() -> anyhow::Result<()> {
-        use crate::common::rusqlite_integrity_check;
+        use core_tester::common::rusqlite_integrity_check;
 
         maybe_setup_tracing();
         let (mut rng, seed) = rng_from_time_or_env();

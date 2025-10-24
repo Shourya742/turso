@@ -8,7 +8,7 @@ use crate::ext::{ExtValue, ExtValueType};
 use crate::numeric::format_float;
 use crate::pseudo::PseudoCursor;
 use crate::schema::Index;
-use crate::storage::btree::BTreeCursor;
+use crate::storage::btree::CursorTrait;
 use crate::storage::sqlite3_ondisk::{read_integer, read_value, read_varint, write_varint};
 use crate::translate::collate::CollationSeq;
 use crate::translate::plan::IterationDirection;
@@ -17,6 +17,7 @@ use crate::vdbe::Register;
 use crate::vtab::VirtualTableCursor;
 use crate::{turso_assert, Completion, CompletionError, Result, IO};
 use std::fmt::{Debug, Display};
+use std::task::Waker;
 
 /// SQLite by default uses 2000 as maximum numbers in a row.
 /// It controlld by the constant called SQLITE_MAX_COLUMN
@@ -2269,7 +2270,7 @@ impl Record {
 }
 
 pub enum Cursor {
-    BTree(Box<BTreeCursor>),
+    BTree(Box<dyn CursorTrait>),
     Pseudo(PseudoCursor),
     Sorter(Sorter),
     Virtual(VirtualTableCursor),
@@ -2289,8 +2290,8 @@ impl Debug for Cursor {
 }
 
 impl Cursor {
-    pub fn new_btree(cursor: BTreeCursor) -> Self {
-        Self::BTree(Box::new(cursor))
+    pub fn new_btree(cursor: Box<dyn CursorTrait>) -> Self {
+        Self::BTree(cursor)
     }
 
     pub fn new_pseudo(cursor: PseudoCursor) -> Self {
@@ -2307,9 +2308,9 @@ impl Cursor {
         Self::MaterializedView(Box::new(cursor))
     }
 
-    pub fn as_btree_mut(&mut self) -> &mut BTreeCursor {
+    pub fn as_btree_mut(&mut self) -> &mut dyn CursorTrait {
         match self {
-            Self::BTree(cursor) => cursor,
+            Self::BTree(cursor) => cursor.as_mut(),
             _ => panic!("Cursor is not a btree"),
         }
     }
@@ -2349,7 +2350,6 @@ impl Cursor {
 #[must_use]
 pub enum IOCompletions {
     Single(Completion),
-    Many(Vec<Completion>),
 }
 
 impl IOCompletions {
@@ -2357,26 +2357,12 @@ impl IOCompletions {
     pub fn wait<I: ?Sized + IO>(self, io: &I) -> Result<()> {
         match self {
             IOCompletions::Single(c) => io.wait_for_completion(c),
-            IOCompletions::Many(completions) => {
-                let mut completions = completions.into_iter();
-                while let Some(c) = completions.next() {
-                    let res = io.wait_for_completion(c);
-                    if res.is_err() {
-                        for c in completions {
-                            c.abort();
-                        }
-                        return res;
-                    }
-                }
-                Ok(())
-            }
         }
     }
 
     pub fn finished(&self) -> bool {
         match self {
             IOCompletions::Single(c) => c.finished(),
-            IOCompletions::Many(completions) => completions.iter().all(|c| c.finished()),
         }
     }
 
@@ -2384,14 +2370,20 @@ impl IOCompletions {
     pub fn abort(&self) {
         match self {
             IOCompletions::Single(c) => c.abort(),
-            IOCompletions::Many(completions) => completions.iter().for_each(|c| c.abort()),
         }
     }
 
     pub fn get_error(&self) -> Option<CompletionError> {
         match self {
             IOCompletions::Single(c) => c.get_error(),
-            IOCompletions::Many(completions) => completions.iter().find_map(|c| c.get_error()),
+        }
+    }
+
+    pub fn set_waker(&self, waker: Option<&Waker>) {
+        if let Some(waker) = waker {
+            match self {
+                IOCompletions::Single(c) => c.set_waker(waker),
+            }
         }
     }
 }
